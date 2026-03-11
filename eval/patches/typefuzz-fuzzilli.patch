@@ -1,0 +1,602 @@
+diff --git a/Sources/Fuzzilli/Evaluation/ProgramCoverageEvaluator.swift b/Sources/Fuzzilli/Evaluation/ProgramCoverageEvaluator.swift
+index 4decc28124f3..0ebb7c7b014a 100644
+--- a/Sources/Fuzzilli/Evaluation/ProgramCoverageEvaluator.swift
++++ b/Sources/Fuzzilli/Evaluation/ProgramCoverageEvaluator.swift
+@@ -16,13 +16,19 @@ import Foundation
+ import libcoverage
+ 
+ /// Represents a set of newly discovered CFG edges in the target program.
++public enum FeedbackMode {
++    case code, type, hybrid
++}
++
+ public class CovEdgeSet: ProgramAspects {
+     private var numEdges: UInt32
+     fileprivate var edges: UnsafeMutablePointer<UInt32>?
++    fileprivate var newTypes: [UInt32]
+ 
+-    init(edges: UnsafeMutablePointer<UInt32>?, numEdges: UInt32) {
++    init(edges: UnsafeMutablePointer<UInt32>?, numEdges: UInt32, newTypes: [UInt32] = []) {
+         self.numEdges = numEdges
+         self.edges = edges
++        self.newTypes = newTypes
+         super.init(outcome: .succeeded)
+     }
+ 
+@@ -84,18 +90,29 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
+     /// In that case, the edge is marked as found, but will not be considered an aspect of any program.
+     private let maxResetCount: UInt64 = 1000
+ 
++    /// Which feedback signal drives corpus inclusion.
++    private let feedbackMode: FeedbackMode
++
++    /// Keep track of how often a type tuple has been reset.
++    private var typeResetCounts : [UInt32:UInt64] = [:]
++
+     /// The current edge coverage percentage.
+     public var currentScore: Double {
+         return Double(context.found_edges) / Double(context.num_edges)
+     }
+ 
++    public var currentTypeScore: UInt32 {
++        return context.found_types
++    }
++
+     /// Context for the C library.
+     private var context = libcoverage.cov_context()
+ 
+-    public init(runner: ScriptRunner) {
++    public init(runner: ScriptRunner, feedbackMode: FeedbackMode = .code) {
+         // In order to keep clean abstractions, any corpus scheduler requiring edge counting
+         // needs to call EnableEdgeTracking(), via downcasting of ProgramEvaluator
+         self.shouldTrackEdgeCounts = false
++        self.feedbackMode = feedbackMode
+ 
+         super.init(name: "Coverage")
+ 
+@@ -140,9 +157,10 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
+     }
+ 
+     override func initialize() {
+-        // Must clear the shared memory bitmap before every execution
++        // Must clear the shared memory bitmaps before every execution
+         fuzzer.registerEventListener(for: fuzzer.events.PreExecute) { execution in
+             libcoverage.cov_clear_bitmap(&self.context)
++            libcoverage.cov_clear_type_bitmap(&self.context)
+         }
+ 
+         // Unlink the shared memory regions on shutdown
+@@ -157,17 +175,50 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
+ 
+     public func evaluate(_ execution: Execution) -> ProgramAspects? {
+         assert(execution.outcome == .succeeded)
++
++        // Always evaluate both code and type coverage to avoid measurement bias.
+         var newEdgeSet = libcoverage.edge_set()
+-        let result = libcoverage.cov_evaluate(&context, &newEdgeSet)
+-        guard result != -1 else {
++        let codeResult = libcoverage.cov_evaluate(&context, &newEdgeSet)
++        guard codeResult != -1 else {
+             logger.error("Could not evaluate sample")
+             return nil
+         }
+ 
+-        if result == 1 {
+-            return CovEdgeSet(edges: newEdgeSet.edge_indices, numEdges: newEdgeSet.count)
++        var newTypeSet = libcoverage.edge_set()
++        let _ = libcoverage.cov_evaluate_types(&context, &newTypeSet)
++        let typesArray = newTypeSet.count > 0
++            ? Array(UnsafeBufferPointer(start: newTypeSet.edge_indices, count: Int(newTypeSet.count)))
++            : [UInt32]()
++        free(newTypeSet.edge_indices)
++
++        let hasNewCode = newEdgeSet.count > 0
++        let hasNewTypes = !typesArray.isEmpty
++
++        let isInteresting: Bool
++        switch feedbackMode {
++        case .code:   isInteresting = hasNewCode
++        case .type:   isInteresting = hasNewTypes
++        case .hybrid: isInteresting = hasNewCode || hasNewTypes
++        }
++
++        if isInteresting {
++            // Only carry aspects relevant to this feedback mode. The
++            // determinism check (processMaybeInteresting) re-executes the
++            // program 5-50x to intersect aspects until convergence. Carrying
++            // cross-metric aspects would force e.g. type-mode samples to pay
++            // that 5-50x cost to stabilize irrelevant code edge intersections,
++            // destroying throughput and falsifying the comparison between modes.
++            switch feedbackMode {
++            case .code:
++                return CovEdgeSet(edges: newEdgeSet.edge_indices, numEdges: newEdgeSet.count)
++            case .type:
++                free(newEdgeSet.edge_indices)
++                return CovEdgeSet(edges: nil, numEdges: 0, newTypes: typesArray)
++            case .hybrid:
++                return CovEdgeSet(edges: newEdgeSet.edge_indices, numEdges: newEdgeSet.count, newTypes: typesArray)
++            }
+         } else {
+-            assert(newEdgeSet.edge_indices == nil && newEdgeSet.count == 0)
++            free(newEdgeSet.edge_indices)
+             return nil
+         }
+     }
+@@ -206,7 +257,16 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
+         if result == -1 {
+             logger.error("Could not compare progam executions")
+         }
+-        return result == 1
++        if result != 1 { return false }
++
++        if !edgeSet.newTypes.isEmpty {
++            let typesResult = edgeSet.newTypes.withUnsafeMutableBufferPointer { buf in
++                libcoverage.cov_compare_types_equal(&context, buf.baseAddress, UInt32(buf.count))
++            }
++            if typesResult != 1 { return false }
++        }
++
++        return true
+     }
+ 
+     public func computeAspectIntersection(of program: Program, with aspects: ProgramAspects)
+@@ -216,77 +276,115 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
+             logger.fatal("Coverage Evaluator received non coverage aspects")
+         }
+ 
+-        // Mark all edges in the provided aspects as undiscovered so they can be retriggered during the next execution.
++        // Mark all aspects as undiscovered so they can be retriggered during the next execution.
+         resetAspects(firstCovEdgeSet)
++        for t in firstCovEdgeSet.newTypes {
++            resetType(t)
++        }
+ 
+-        // Execute the program and collect coverage information.
++        // Execute the program and evaluate both code and type coverage directly,
++        // bypassing the feedbackMode filter that evaluate() applies.
+         let execution = fuzzer.execute(program, purpose: .checkForDeterministicBehavior)
+         guard execution.outcome == .succeeded else { return nil }
+-        guard let secondCovEdgeSet = evaluate(execution) as? CovEdgeSet else { return nil }
+ 
+-        let firstEdgeSet = Set(
+-            UnsafeBufferPointer(start: firstCovEdgeSet.edges, count: Int(firstCovEdgeSet.count)))
+-        let secondEdgeSet = Set(
+-            UnsafeBufferPointer(start: secondCovEdgeSet.edges, count: Int(secondCovEdgeSet.count)))
++        var secondCodeEdges = libcoverage.edge_set()
++        let codeResult = libcoverage.cov_evaluate(&context, &secondCodeEdges)
++        guard codeResult != -1 else {
++            logger.error("Could not evaluate sample")
++            return nil
++        }
++
++        var secondTypeEdges = libcoverage.edge_set()
++        let _ = libcoverage.cov_evaluate_types(&context, &secondTypeEdges)
++        let secondTypesArray = secondTypeEdges.count > 0
++            ? Array(UnsafeBufferPointer(start: secondTypeEdges.edge_indices, count: Int(secondTypeEdges.count)))
++            : [UInt32]()
++        free(secondTypeEdges.edge_indices)
++
++        let secondCovEdgeSet = CovEdgeSet(edges: secondCodeEdges.edge_indices, numEdges: secondCodeEdges.count, newTypes: secondTypesArray)
++
++        // Intersect code edges and reset non-deterministic ones.
++        let firstEdgeSet = Set(UnsafeBufferPointer(start: firstCovEdgeSet.edges, count: Int(firstCovEdgeSet.count)))
++        let secondEdgeSet = Set(UnsafeBufferPointer(start: secondCovEdgeSet.edges, count: Int(secondCovEdgeSet.count)))
+ 
+-        // Reset all edges that were only triggered by the 2nd execution (those only triggered by the 1st execution were already reset earlier).
+         for edge in secondEdgeSet.subtracting(firstEdgeSet) {
+             resetEdge(edge)
+         }
+-
+-        // Compute the intersection of the edges.
+         let intersectedEdgeSet = secondEdgeSet.intersection(firstEdgeSet)
+-        guard intersectedEdgeSet.count != 0 else { return nil }
+ 
+-        // Here we reuse one of the existing CovEdgeSets instead of creating a new one to avoid a malloc() and free() of the backing buffer.
++        // Intersect type tuples and reset non-deterministic ones.
++        let firstTypeSet = Set(firstCovEdgeSet.newTypes)
++        let secondTypeSet = Set(secondCovEdgeSet.newTypes)
++        let intersectedTypeSet = secondTypeSet.intersection(firstTypeSet)
++
++        for t in secondTypeSet.subtracting(firstTypeSet) {
++            resetType(t)
++        }
++
++        // Check if the intersection still has relevant aspects for this feedback mode.
++        let isStillInteresting: Bool
++        switch feedbackMode {
++        case .code:   isStillInteresting = !intersectedEdgeSet.isEmpty
++        case .type:   isStillInteresting = !intersectedTypeSet.isEmpty
++        case .hybrid: isStillInteresting = !intersectedEdgeSet.isEmpty || !intersectedTypeSet.isEmpty
++        }
++        guard isStillInteresting else { return nil }
++
++        // Reuse the second CovEdgeSet's buffer for the result.
+         let intersectedCovEdgeSet = secondCovEdgeSet
+         intersectedCovEdgeSet.setEdges(intersectedEdgeSet)
++        intersectedCovEdgeSet.newTypes = Array(intersectedTypeSet)
+ 
+         return intersectedCovEdgeSet
+     }
+ 
+     public func exportState() -> Data {
++        let typeBitmapSize = Int(TYPE_COV_MAX_LOCATIONS) * Int(TYPE_COV_MAX_TYPES) / 8
+         var state = Data()
+         state.append(Data(bytes: &context.num_edges, count: 4))
+         state.append(Data(bytes: &context.bitmap_size, count: 4))
+         state.append(Data(bytes: &context.found_edges, count: 4))
++        state.append(Data(bytes: &context.found_types, count: 4))
+         state.append(context.virgin_bits, count: Int(context.bitmap_size))
+         state.append(context.crash_bits, count: Int(context.bitmap_size))
++        state.append(context.virgin_type_bits, count: typeBitmapSize)
+         return state
+     }
+ 
+     public func importState(_ state: Data) throws {
+         assert(isInitialized)
+-        let headerSize = 12  // 3 x 4 bytes: num_edges, bitmap_size, found_edges. See exportState() above
++        let typeBitmapSize = Int(TYPE_COV_MAX_LOCATIONS) * Int(TYPE_COV_MAX_TYPES) / 8
++        let headerSize = 16     // 4 x 4 bytes: num_edges, bitmap_size, found_edges, found_types
+ 
+-        guard state.count == headerSize + Int(context.bitmap_size) * 2 else {
+-            throw FuzzilliError.evaluatorStateImportError(
+-                "Cannot import coverage state as it has an unexpected size. Ensure all instances use the same build of the target"
+-            )
++        guard state.count == headerSize + Int(context.bitmap_size) * 2 + typeBitmapSize else {
++            throw FuzzilliError.evaluatorStateImportError("Cannot import coverage state as it has an unexpected size. Ensure all instances use the same build of the target")
+         }
+ 
+         let numEdges = state.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self) }
+         let bitmapSize = state.withUnsafeBytes { $0.load(fromByteOffset: 4, as: UInt32.self) }
+         let foundEdges = state.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt32.self) }
++        let foundTypes = state.withUnsafeBytes { $0.load(fromByteOffset: 12, as: UInt32.self) }
+ 
+         guard bitmapSize == context.bitmap_size && numEdges == context.num_edges else {
+-            throw FuzzilliError.evaluatorStateImportError(
+-                "Cannot import coverage state due to different bitmap sizes. Ensure all instances use the same build of the target"
+-            )
++            throw FuzzilliError.evaluatorStateImportError("Cannot import coverage state due to different bitmap sizes. Ensure all instances use the same build of the target")
+         }
+ 
+         context.found_edges = foundEdges
++        context.found_types = foundTypes
+ 
+         var start = state.startIndex + headerSize
+         state.copyBytes(to: context.virgin_bits, from: start..<start + Int(bitmapSize))
+         start += Int(bitmapSize)
+         state.copyBytes(to: context.crash_bits, from: start..<start + Int(bitmapSize))
++        start += Int(bitmapSize)
++        state.copyBytes(to: context.virgin_type_bits, from: start..<start + typeBitmapSize)
+ 
+-        logger.info("Imported existing coverage state with \(foundEdges) edges already discovered")
++        logger.info("Imported existing coverage state with \(foundEdges) edges, \(foundTypes) type tuples")
+     }
+ 
+     public func resetState() {
+         resetCounts = [:]
++        typeResetCounts = [:]
+         libcoverage.cov_reset_state(&context)
+     }
+ 
+@@ -298,6 +396,13 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
+         }
+     }
+ 
++    private func resetType(_ index: UInt32) {
++        typeResetCounts[index] = (typeResetCounts[index] ?? 0) + 1
++        if typeResetCounts[index]! <= maxResetCount {
++            libcoverage.cov_clear_type_data(&context, index)
++        }
++    }
++
+     private func resetAspects(_ aspects: CovEdgeSet) {
+         for i in 0..<Int(aspects.count) {
+             resetEdge(aspects.edges![i])
+diff --git a/Sources/Fuzzilli/Evaluation/ProgramEvaluator.swift b/Sources/Fuzzilli/Evaluation/ProgramEvaluator.swift
+index 0d19ccba2bf5..7cb805e1a1c0 100644
+--- a/Sources/Fuzzilli/Evaluation/ProgramEvaluator.swift
++++ b/Sources/Fuzzilli/Evaluation/ProgramEvaluator.swift
+@@ -33,6 +33,9 @@ public protocol ProgramEvaluator: Component {
+     /// The current, accumulated score of all seen samples. E.g. total coverage.
+     var currentScore: Double { get }
+ 
++    /// The number of unique (location, type) tuples found so far.
++    var currentTypeScore: UInt32 { get }
++
+     /// Export the current state of this evaluator so it can be replicated.
+     func exportState() -> Data
+ 
+diff --git a/Sources/Fuzzilli/Modules/Statistics.swift b/Sources/Fuzzilli/Modules/Statistics.swift
+index fcebf9974b70..16c938a0b1dd 100644
+--- a/Sources/Fuzzilli/Modules/Statistics.swift
++++ b/Sources/Fuzzilli/Modules/Statistics.swift
+@@ -181,6 +181,7 @@ public class Statistics: Module {
+         fuzzer.registerEventListener(for: fuzzer.events.InterestingProgramFound) { ev in
+             self.ownData.interestingSamples += 1
+             self.ownData.coverage = fuzzer.evaluator.currentScore
++            self.ownData.typeCoverage = UInt64(fuzzer.evaluator.currentTypeScore)
+             self.corpusProgramSizeAvg.add(ev.program.size)
+             self.corpusSize = fuzzer.corpus.size
+         }
+diff --git a/Sources/Fuzzilli/Protobuf/sync.pb.swift b/Sources/Fuzzilli/Protobuf/sync.pb.swift
+index f17c236ce405..e2e319be9a2b 100644
+--- a/Sources/Fuzzilli/Protobuf/sync.pb.swift
++++ b/Sources/Fuzzilli/Protobuf/sync.pb.swift
+@@ -183,6 +183,12 @@ public struct Fuzzilli_Protobuf_Statistics: @unchecked Sendable {
+     set {_uniqueStorage()._differentialSamples = newValue}
+   }
+ 
++  //// The number of unique (location, type) tuples found.
++  public var typeCoverage: UInt64 {
++    get {return _storage._typeCoverage}
++    set {_uniqueStorage()._typeCoverage = newValue}
++  }
++
+   public var unknownFields = SwiftProtobuf.UnknownStorage()
+ 
+   public init() {}
+@@ -281,7 +287,7 @@ extension Fuzzilli_Protobuf_FuzzerState: SwiftProtobuf.Message, SwiftProtobuf._M
+ 
+ extension Fuzzilli_Protobuf_Statistics: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+   public static let protoMessageName: String = _protobuf_package + ".Statistics"
+-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}totalSamples\0\u{1}validSamples\0\u{1}interestingSamples\0\u{1}timedOutSamples\0\u{1}crashingSamples\0\u{1}totalExecs\0\u{1}avgCorpusSize\0\u{1}avgProgramSize\0\u{1}avgCorpusProgramSize\0\u{1}avgExecutionTime\0\u{1}execsPerSecond\0\u{1}fuzzerOverhead\0\u{1}minimizationOverhead\0\u{1}numChildNodes\0\u{1}coverage\0\u{1}correctnessRate\0\u{1}timeoutRate\0\u{1}differentialSamples\0")
++  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}totalSamples\0\u{1}validSamples\0\u{1}interestingSamples\0\u{1}timedOutSamples\0\u{1}crashingSamples\0\u{1}totalExecs\0\u{1}avgCorpusSize\0\u{1}avgProgramSize\0\u{1}avgCorpusProgramSize\0\u{1}avgExecutionTime\0\u{1}execsPerSecond\0\u{1}fuzzerOverhead\0\u{1}minimizationOverhead\0\u{1}numChildNodes\0\u{1}coverage\0\u{1}correctnessRate\0\u{1}timeoutRate\0\u{1}differentialSamples\0\u{1}typeCoverage\0")
+ 
+   fileprivate class _StorageClass {
+     var _totalSamples: UInt64 = 0
+@@ -302,6 +308,7 @@ extension Fuzzilli_Protobuf_Statistics: SwiftProtobuf.Message, SwiftProtobuf._Me
+     var _correctnessRate: Double = 0
+     var _timeoutRate: Double = 0
+     var _differentialSamples: UInt64 = 0
++    var _typeCoverage: UInt64 = 0
+ 
+       // This property is used as the initial default value for new instances of the type.
+       // The type itself is protecting the reference to its storage via CoW semantics.
+@@ -330,6 +337,7 @@ extension Fuzzilli_Protobuf_Statistics: SwiftProtobuf.Message, SwiftProtobuf._Me
+       _correctnessRate = source._correctnessRate
+       _timeoutRate = source._timeoutRate
+       _differentialSamples = source._differentialSamples
++      _typeCoverage = source._typeCoverage
+     }
+   }
+ 
+@@ -366,6 +374,7 @@ extension Fuzzilli_Protobuf_Statistics: SwiftProtobuf.Message, SwiftProtobuf._Me
+         case 16: try { try decoder.decodeSingularDoubleField(value: &_storage._correctnessRate) }()
+         case 17: try { try decoder.decodeSingularDoubleField(value: &_storage._timeoutRate) }()
+         case 18: try { try decoder.decodeSingularUInt64Field(value: &_storage._differentialSamples) }()
++        case 19: try { try decoder.decodeSingularUInt64Field(value: &_storage._typeCoverage) }()
+         default: break
+         }
+       }
+@@ -428,6 +437,9 @@ extension Fuzzilli_Protobuf_Statistics: SwiftProtobuf.Message, SwiftProtobuf._Me
+       if _storage._differentialSamples != 0 {
+         try visitor.visitSingularUInt64Field(value: _storage._differentialSamples, fieldNumber: 18)
+       }
++      if _storage._typeCoverage != 0 {
++        try visitor.visitSingularUInt64Field(value: _storage._typeCoverage, fieldNumber: 19)
++      }
+     }
+     try unknownFields.traverse(visitor: &visitor)
+   }
+@@ -455,6 +467,7 @@ extension Fuzzilli_Protobuf_Statistics: SwiftProtobuf.Message, SwiftProtobuf._Me
+         if _storage._correctnessRate != rhs_storage._correctnessRate {return false}
+         if _storage._timeoutRate != rhs_storage._timeoutRate {return false}
+         if _storage._differentialSamples != rhs_storage._differentialSamples {return false}
++        if _storage._typeCoverage != rhs_storage._typeCoverage {return false}
+         return true
+       }
+       if !storagesAreEqual {return false}
+diff --git a/Sources/Fuzzilli/Protobuf/sync.proto b/Sources/Fuzzilli/Protobuf/sync.proto
+index 39a18a115e8d..25627a2bf8b9 100644
+--- a/Sources/Fuzzilli/Protobuf/sync.proto
++++ b/Sources/Fuzzilli/Protobuf/sync.proto
+@@ -85,4 +85,7 @@ message Statistics {
+ 
+         /// The number of programs resulting in valid differential produced.
+         uint64 differentialSamples = 18;
++
++        /// The number of unique (location, type) tuples found.
++        uint64 typeCoverage = 19;
+ }
+diff --git a/Sources/Fuzzilli/Util/MockFuzzer.swift b/Sources/Fuzzilli/Util/MockFuzzer.swift
+index 91d11870781e..87372a334d38 100644
+--- a/Sources/Fuzzilli/Util/MockFuzzer.swift
++++ b/Sources/Fuzzilli/Util/MockFuzzer.swift
+@@ -63,6 +63,10 @@ class MockEvaluator: ProgramEvaluator {
+         return 13.37
+     }
+ 
++    var currentTypeScore: UInt32 {
++        return 0
++    }
++
+     func initialize(with fuzzer: Fuzzer) {}
+ 
+     var isInitialized: Bool {
+diff --git a/Sources/FuzzilliCli/main.swift b/Sources/FuzzilliCli/main.swift
+index 8a95f081a5d9..bcf57a68a592 100644
+--- a/Sources/FuzzilliCli/main.swift
++++ b/Sources/FuzzilliCli/main.swift
+@@ -101,6 +101,7 @@ if args["-h"] != nil || args["--help"] != nil || args.numPositionalArguments !=
+             --tag=tag                    : Optional string tag associated with this instance which will be stored in the settings.json file as well as in crashing samples.
+                                            This can for example be used to remember the target revision that is being fuzzed.
+             --wasm                       : Enable Wasm CodeGenerators (see WasmCodeGenerators.swift).
++            --feedback-mode=mode         : Which coverage feedback drives corpus inclusion: "code" (default), "type", "hybrid".
+             --forDifferentialFuzzing     : Enable additional features for better support of external differential fuzzing.
+ 
+         """)
+@@ -190,6 +191,15 @@ if let raw_timeout = args.string(for: "--timeout") {
+     timeout = profile.timeout
+ }
+ 
++let feedbackModeFlag = args["--feedback-mode"] ?? "code"
++let feedbackMode: FeedbackMode
++switch feedbackModeFlag.lowercased() {
++case "code":   feedbackMode = .code
++case "type":   feedbackMode = .type
++case "hybrid": feedbackMode = .hybrid
++default: configError("Invalid --feedback-mode. Valid values: 'code', 'type', 'hybrid'")
++}
++
+ guard numJobs >= 1 else {
+     configError("Must have at least 1 job")
+ }
+@@ -567,7 +577,7 @@ func makeFuzzer(with configuration: Configuration) -> Fuzzer {
+         alwaysEmitVariables: configuration.forDifferentialFuzzing)
+ 
+     // The evaluator to score produced samples.
+-    let evaluator = ProgramCoverageEvaluator(runner: runner)
++    let evaluator = ProgramCoverageEvaluator(runner: runner, feedbackMode: feedbackMode)
+ 
+     // Corpus managing interesting programs that have been found during fuzzing.
+     let corpus: Corpus
+diff --git a/Sources/libcoverage/coverage.c b/Sources/libcoverage/coverage.c
+index 9827d3f28854..3f3f5037ccea 100644
+--- a/Sources/libcoverage/coverage.c
++++ b/Sources/libcoverage/coverage.c
+@@ -123,9 +123,12 @@ void cov_finish_initialization(struct cov_context* context, int should_track_edg
+ 
+     context->virgin_bits = malloc(bitmap_size);
+     context->crash_bits = malloc(bitmap_size);
++    context->virgin_type_bits = malloc(TYPE_COV_BITMAP_SIZE);
+ 
+     memset(context->virgin_bits, 0xff, bitmap_size);
+     memset(context->crash_bits, 0xff, bitmap_size);
++    memset(context->virgin_type_bits, 0xff, TYPE_COV_BITMAP_SIZE);
++    context->found_types = 0;
+ 
+     if (should_track_edges) {
+         context->edge_count = malloc(sizeof(uint32_t) * num_edges);
+@@ -230,6 +233,17 @@ void cov_clear_bitmap(struct cov_context* context)
+     memset(context->shmem->edges, 0, context->bitmap_size);
+ }
+ 
++int cov_compare_types_equal(struct cov_context* context, uint32_t* types, uint32_t num_types)
++{
++    uint8_t* type_bitmap = (uint8_t*)context->shmem + TYPE_COV_OFFSET;
++    for (uint32_t i = 0; i < num_types; i++) {
++        uint32_t idx = types[i];
++        if ((type_bitmap[idx / 8] & (1 << (idx % 8))) == 0)
++            return 0;
++    }
++    return 1;
++}
++
+ int cov_get_edge_counts(struct cov_context* context, struct edge_counts* edges)
+ {
+     if(!context->should_track_edges) {
+@@ -254,6 +268,7 @@ void cov_clear_edge_data(struct cov_context* context, uint32_t index)
+ void cov_reset_state(struct cov_context* context) {
+     memset(context->virgin_bits, 0xff, context->bitmap_size);
+     memset(context->crash_bits, 0xff, context->bitmap_size);
++    memset(context->virgin_type_bits, 0xff, TYPE_COV_BITMAP_SIZE);
+ 
+     if (context->edge_count != NULL) {
+         memset(context->edge_count, 0, sizeof(uint32_t) * context->num_edges);
+@@ -264,5 +279,50 @@ void cov_reset_state(struct cov_context* context) {
+     clear_edge(context->crash_bits, 0);
+ 
+     context->found_edges = 0;
++    context->found_types = 0;
++}
++
++int cov_evaluate_types(struct cov_context* context, struct edge_set* new_types)
++{
++    uint8_t* type_bitmap = (uint8_t*)context->shmem + TYPE_COV_OFFSET;
++    uint64_t* current = (uint64_t*)type_bitmap;
++    uint64_t* end = (uint64_t*)(type_bitmap + TYPE_COV_BITMAP_SIZE);
++    uint64_t* virgin = (uint64_t*)context->virgin_type_bits;
++
++    new_types->count = 0;
++    new_types->edge_indices = NULL;
++
++    while (current < end) {
++        if (*current && unlikely(*current & *virgin)) {
++            uint32_t base = (uint32_t)((uintptr_t)current - (uintptr_t)type_bitmap) * 8;
++            for (uint32_t i = base; i < base + 64; i++) {
++                if (edge(type_bitmap, i) == 1 && edge(context->virgin_type_bits, i) == 1) {
++                    clear_edge(context->virgin_type_bits, i);
++                    new_types->count += 1;
++                    new_types->edge_indices = realloc(new_types->edge_indices,
++                                                     new_types->count * sizeof(uint32_t));
++                    new_types->edge_indices[new_types->count - 1] = i;
++                }
++            }
++        }
++        current++;
++        virgin++;
++    }
++
++    context->found_types += new_types->count;
++    return new_types->count > 0;
++}
++
++void cov_clear_type_bitmap(struct cov_context* context)
++{
++    uint8_t* type_bitmap = (uint8_t*)context->shmem + TYPE_COV_OFFSET;
++    memset(type_bitmap, 0, TYPE_COV_BITMAP_SIZE);
++}
++
++void cov_clear_type_data(struct cov_context* context, uint32_t index)
++{
++    context->found_types -= 1;
++    assert(!edge(context->virgin_type_bits, index));
++    set_edge(context->virgin_type_bits, index);
+ }
+ 
+diff --git a/Sources/libcoverage/include/libcoverage.h b/Sources/libcoverage/include/libcoverage.h
+index 9f61032ba51a..5a6a6eb80038 100644
+--- a/Sources/libcoverage/include/libcoverage.h
++++ b/Sources/libcoverage/include/libcoverage.h
+@@ -33,11 +33,17 @@ struct edge_counts {
+     uint32_t * edge_hit_count;
+ };
+ 
+-// Size of the shared memory region. Defines an upper limit on the number of
+-// coverage edges that can be tracked. When bumping this number, please also
+-// update Target/coverage.c.
+-#define SHM_SIZE 0x200000
+-#define MAX_EDGES ((SHM_SIZE - 4) * 8)
++// Shared memory layout:
++//   [0x000000]          uint32_t num_edges
++//   [0x000004]          uint8_t edges[]       (bit-packed code coverage)
++//   [TYPE_COV_OFFSET]   uint8_t type_bits[]   (bit-packed type coverage)
++//   [SHM_SIZE]          end
++#define SHM_SIZE                0x200000
++#define TYPE_COV_MAX_LOCATIONS  1024
++#define TYPE_COV_MAX_TYPES      4096
++#define TYPE_COV_BITMAP_SIZE    ((TYPE_COV_MAX_LOCATIONS * TYPE_COV_MAX_TYPES) / 8)
++#define TYPE_COV_OFFSET         (SHM_SIZE - TYPE_COV_BITMAP_SIZE)
++#define MAX_EDGES               ((TYPE_COV_OFFSET - 4) * 8)
+ 
+ // Structure of the shared memory region.
+ struct shmem_data {
+@@ -66,6 +72,12 @@ struct cov_context {
+     // Total number of edges that have been discovered so far.
+     uint32_t found_edges;
+ 
++    // Total number of type tuples that have been discovered so far.
++    uint32_t found_types;
++
++    // Bitmap of type tuples that have been discovered so far.
++    uint8_t* virgin_type_bits;
++
+ #if defined(_WIN32)
+     // Mapping Handle
+     HANDLE hMapping;
+@@ -86,6 +98,7 @@ int cov_evaluate(struct cov_context* context, struct edge_set* new_edges);
+ int cov_evaluate_crash(struct cov_context*);
+ 
+ int cov_compare_equal(struct cov_context*, uint32_t* edges, uint32_t num_edges);
++int cov_compare_types_equal(struct cov_context*, uint32_t* types, uint32_t num_types);
+ 
+ void cov_clear_bitmap(struct cov_context*);
+ 
+@@ -93,4 +106,8 @@ int cov_get_edge_counts(struct cov_context* context, struct edge_counts* edges);
+ void cov_clear_edge_data(struct cov_context* context, uint32_t index);
+ void cov_reset_state(struct cov_context* context);
+ 
++int cov_evaluate_types(struct cov_context* context, struct edge_set* new_types);
++void cov_clear_type_bitmap(struct cov_context* context);
++void cov_clear_type_data(struct cov_context* context, uint32_t index);
++
+ #endif
